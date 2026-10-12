@@ -25,12 +25,13 @@ GLOBAL_GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
 import telebot
 from telebot import types
 
-# Optional packages
+# Modern Google GenAI SDK
 try:
-    import google.generativeai as genai
-    HAS_GEMINI = True
+    from google import genai
+    from google.genai import types as genai_types
+    HAS_GENAI = True
 except ImportError:
-    HAS_GEMINI = False
+    HAS_GENAI = False
 
 try:
     import pypdf
@@ -303,18 +304,18 @@ Ko'p xarajatlar (masalan, bank ko'chirmasi) uchun:
 """
 
 def call_gemini_vision(api_key, image_bytes, prompt="Ushbu chek fotosuratidan ma'lumotlarni o'qing"):
-    if not HAS_GEMINI or not api_key:
+    if not HAS_GENAI or not api_key:
         return None
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-1.5-flash", system_instruction=GEMINI_SYSTEM_PROMPT)
-        image_part = {
-            "mime_type": "image/jpeg",
-            "data": image_bytes
-        }
-        response = model.generate_content([image_part, prompt])
+        client = genai.Client(api_key=api_key)
+        part = genai_types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
+        config = genai_types.GenerateContentConfig(system_instruction=GEMINI_SYSTEM_PROMPT)
+        response = client.models.generate_content(
+            model="gemini-3.8-flash",
+            contents=[part, prompt],
+            config=config
+        )
         txt = response.text.strip()
-        # JSON ni tozalash
         txt = re.sub(r'^```json\s*', '', txt)
         txt = re.sub(r'```$', '', txt).strip()
         return json.loads(txt)
@@ -323,17 +324,18 @@ def call_gemini_vision(api_key, image_bytes, prompt="Ushbu chek fotosuratidan ma
         return None
 
 def call_gemini_audio(api_key, audio_bytes, mime_type="audio/ogg"):
-    if not HAS_GEMINI or not api_key:
+    if not HAS_GENAI or not api_key:
         return None
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-1.5-flash", system_instruction=GEMINI_SYSTEM_PROMPT)
-        audio_part = {
-            "mime_type": mime_type,
-            "data": audio_bytes
-        }
+        client = genai.Client(api_key=api_key)
+        part = genai_types.Part.from_bytes(data=audio_bytes, mime_type=mime_type)
         prompt = "Ushbu ovozli xabarni eshitib, xarajat summasi va nima uchun sarflanganini aniqlang. Bugungi sana: " + date.today().strftime("%Y-%m-%d")
-        response = model.generate_content([audio_part, prompt])
+        config = genai_types.GenerateContentConfig(system_instruction=GEMINI_SYSTEM_PROMPT)
+        response = client.models.generate_content(
+            model="gemini-3.8-flash",
+            contents=[part, prompt],
+            config=config
+        )
         txt = response.text.strip()
         txt = re.sub(r'^```json\s*', '', txt)
         txt = re.sub(r'```$', '', txt).strip()
@@ -343,13 +345,17 @@ def call_gemini_audio(api_key, audio_bytes, mime_type="audio/ogg"):
         return None
 
 def call_gemini_text(api_key, user_text):
-    if not HAS_GEMINI or not api_key:
+    if not HAS_GENAI or not api_key:
         return None
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-1.5-flash", system_instruction=GEMINI_SYSTEM_PROMPT)
+        client = genai.Client(api_key=api_key)
         prompt = f"Foydalanuvchi xabari: '{user_text}'. Bugungi sana: {date.today().strftime('%Y-%m-%d')}."
-        response = model.generate_content(prompt)
+        config = genai_types.GenerateContentConfig(system_instruction=GEMINI_SYSTEM_PROMPT)
+        response = client.models.generate_content(
+            model="gemini-3.8-flash",
+            contents=prompt,
+            config=config
+        )
         txt = response.text.strip()
         txt = re.sub(r'^```json\s*', '', txt)
         txt = re.sub(r'```$', '', txt).strip()
@@ -375,17 +381,21 @@ def extract_text_from_pdf(pdf_path):
         return ""
 
 def parse_bank_statement_with_gemini(api_key, text):
-    if not HAS_GEMINI or not api_key:
+    if not HAS_GENAI or not api_key:
         return None
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-1.5-flash", system_instruction=GEMINI_SYSTEM_PROMPT)
+        client = genai.Client(api_key=api_key)
         prompt = (
             "Ushbu bank ko'chirmasidan FAQAT karta xarajatlarini (chiqimlarni) ajratib oling. "
             "Har bir xarajat uchun sana, to'lov qilingan joy va aniq summani qayd eting. "
             "To'lov turi: 'Karta'. Natijani JSON ro'yxat shaklida qaytaring:\n\n" + text[:15000]
         )
-        response = model.generate_content(prompt)
+        config = genai_types.GenerateContentConfig(system_instruction=GEMINI_SYSTEM_PROMPT)
+        response = client.models.generate_content(
+            model="gemini-3.8-flash",
+            contents=prompt,
+            config=config
+        )
         txt = response.text.strip()
         txt = re.sub(r'^```json\s*', '', txt)
         txt = re.sub(r'```$', '', txt).strip()
