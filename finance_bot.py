@@ -43,6 +43,34 @@ try:
 except ImportError:
     HAS_PYPDF = False
 
+try:
+    import docx
+    HAS_DOCX = True
+except ImportError:
+    HAS_DOCX = False
+
+try:
+    import openpyxl
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
+
+import zipfile
+import xml.etree.ElementTree as ET
+import csv
+from html.parser import HTMLParser
+
+class SimpleHTMLTextExtractor(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.text_parts = []
+    def handle_data(self, data):
+        c = data.strip()
+        if c:
+            self.text_parts.append(c)
+    def get_text(self):
+        return "\n".join(self.text_parts)
+
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "finance.db")
@@ -492,7 +520,7 @@ def call_gemini_text(api_key, user_text):
         print(f"Gemini Text Error: {e}")
         return None
 
-# --- PDF BANL KO'CHIRMALARI BILAN ISHLASH ---
+# --- HUJJATLAR VA MATN REDAKTORI FAYLLARI BILAN ISHLASH ---
 def extract_text_from_pdf(pdf_path):
     if not HAS_PYPDF:
         return ""
@@ -508,15 +536,195 @@ def extract_text_from_pdf(pdf_path):
         print(f"PDF extract error: {e}")
         return ""
 
-def parse_bank_statement_with_gemini(api_key, text):
+def extract_text_from_document(file_path, file_name):
+    """
+    Har qanday matn redaktori va ofis formatlaridan (Word, Excel, PDF, TXT, CSV, RTF, ODT, HTML, JSON, MD) matn ajratib oladi.
+    """
+    ext = os.path.splitext(file_name.lower())[1]
+    
+    # 1. PDF
+    if ext == ".pdf":
+        return extract_text_from_pdf(file_path)
+        
+    # 2. Oddiy matn fayllari: TXT, LOG, MD, INI, CFG, TEXT
+    if ext in [".txt", ".text", ".log", ".md", ".markdown", ".ini", ".cfg"]:
+        for enc in ['utf-8-sig', 'utf-8', 'cp1251', 'latin-1']:
+            try:
+                with open(file_path, 'r', encoding=enc) as f:
+                    return f.read()
+            except UnicodeDecodeError:
+                continue
+            except Exception:
+                break
+        return ""
+        
+    # 3. CSV / TSV
+    if ext in [".csv", ".tsv"]:
+        delimiter = '\t' if ext == ".tsv" else ','
+        for enc in ['utf-8-sig', 'utf-8', 'cp1251', 'latin-1']:
+            try:
+                rows_text = []
+                with open(file_path, 'r', encoding=enc) as f:
+                    reader = csv.reader(f, delimiter=delimiter)
+                    for r in reader:
+                        if any(c.strip() for c in r):
+                            rows_text.append(" | ".join([c.strip() for c in r]))
+                if rows_text:
+                    return "\n".join(rows_text)
+            except Exception:
+                continue
+        return ""
+        
+    # 4. JSON
+    if ext == ".json":
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return json.dumps(data, ensure_ascii=False, indent=2)
+        except Exception:
+            try:
+                with open(file_path, 'r', encoding='cp1251') as f:
+                    return f.read()
+            except Exception:
+                return ""
+                
+    # 5. HTML / HTM
+    if ext in [".html", ".htm"]:
+        for enc in ['utf-8', 'cp1251', 'latin-1']:
+            try:
+                with open(file_path, 'r', encoding=enc) as f:
+                    html_content = f.read()
+                parser = SimpleHTMLTextExtractor()
+                parser.feed(html_content)
+                txt = parser.get_text()
+                if txt.strip():
+                    return txt
+            except Exception:
+                continue
+        return ""
+        
+    # 6. RTF (Rich Text Format - WordPad va boshqalar)
+    if ext == ".rtf":
+        try:
+            with open(file_path, 'r', encoding='latin-1', errors='ignore') as f:
+                rtf_content = f.read()
+            clean = re.sub(r'\\[a-z]{1,32}(-?\d+)? ?', ' ', rtf_content)
+            clean = re.sub(r'[{}]', ' ', clean)
+            lines = [l.strip() for l in clean.splitlines() if l.strip()]
+            return "\n".join(lines)
+        except Exception:
+            return ""
+            
+    # 7. Word: DOCX
+    if ext == ".docx":
+        # python-docx orqali o'qish
+        if HAS_DOCX:
+            try:
+                doc = docx.Document(file_path)
+                paras = [p.text for p in doc.paragraphs if p.text.strip()]
+                for table in doc.tables:
+                    for row in table.rows:
+                        row_vals = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                        if row_vals:
+                            paras.append(" | ".join(row_vals))
+                if paras:
+                    return "\n".join(paras)
+            except Exception as e:
+                print(f"docx library error: {e}")
+        # Zaxira (mustaqil ZIP+XML orqali)
+        try:
+            with zipfile.ZipFile(file_path) as z:
+                xml_content = z.read('word/document.xml')
+                tree = ET.fromstring(xml_content)
+                paras = []
+                for p in tree.iter():
+                    if p.tag.endswith('}p'):
+                        p_text = "".join(node.text for node in p.iter() if node.tag.endswith('}t') and node.text)
+                        if p_text.strip():
+                            paras.append(p_text.strip())
+                if paras:
+                    return "\n".join(paras)
+        except Exception as e:
+            print(f"docx fallback error: {e}")
+            
+    # 8. Excel: XLSX
+    if ext in [".xlsx", ".xlsm"]:
+        if HAS_OPENPYXL:
+            try:
+                wb = openpyxl.load_workbook(file_path, data_only=True)
+                sheets_text = []
+                for sheet in wb.worksheets:
+                    for row in sheet.iter_rows(values_only=True):
+                        vals = [str(v).strip() for v in row if v is not None and str(v).strip()]
+                        if vals:
+                            sheets_text.append(" | ".join(vals))
+                if sheets_text:
+                    return "\n".join(sheets_text)
+            except Exception as e:
+                print(f"openpyxl error: {e}")
+        try:
+            with zipfile.ZipFile(file_path) as z:
+                shared = []
+                if 'xl/sharedStrings.xml' in z.namelist():
+                    s_tree = ET.fromstring(z.read('xl/sharedStrings.xml'))
+                    for node in s_tree.iter():
+                        if node.tag.endswith('}t') and node.text:
+                            shared.append(node.text)
+                return "\n".join(shared)
+        except Exception:
+            pass
+            
+    # 9. OpenDocument: ODT (LibreOffice / OpenOffice)
+    if ext == ".odt":
+        try:
+            with zipfile.ZipFile(file_path) as z:
+                xml_content = z.read('content.xml')
+                tree = ET.fromstring(xml_content)
+                texts = []
+                for node in tree.iter():
+                    if node.text and node.text.strip():
+                        texts.append(node.text.strip())
+                return "\n".join(texts)
+        except Exception:
+            pass
+
+    # 10. Universal zaxira (har qanday boshqa faylni xom matn sifatida ochish)
+    for enc in ['utf-8', 'cp1251', 'latin-1']:
+        try:
+            with open(file_path, 'r', encoding=enc, errors='ignore') as f:
+                content = f.read(50000)
+                printable = sum(1 for c in content if c.isprintable() or c in '\n\r\t')
+                if printable > len(content) * 0.7:
+                    return content
+        except Exception:
+            continue
+            
+    return ""
+
+def parse_document_with_gemini(api_key, text, file_name="hujjat"):
     if not HAS_GENAI or not api_key:
         return None
     try:
         client = genai.Client(api_key=api_key)
         prompt = (
-            "Ushbu bank ko'chirmasidan FAQAT karta xarajatlarini (chiqimlarni) ajratib oling. "
-            "Har bir xarajat uchun sana, to'lov qilingan joy va aniq summani qayd eting. "
-            "To'lov turi: 'Karta'. Natijani JSON ro'yxat shaklida qaytaring:\n\n" + text[:15000]
+            f"Foydalanuvchi yuborgan hujjat ({file_name}) ichidan barcha xarajatlarni (chiqimlarni) ajratib oling. "
+            "Bu matn redaktorida yozilgan qaydlar, Word hujjati, Excel jadvali, CSV fayl yoki bank ko'chirmasi bo'lishi mumkin. "
+            "Har bir xarajat uchun quyidagi ma'lumotlarni aniqlang:\n"
+            "- date: Sana YYYY-MM-DD ko'rinishida (agar sanasi aniq bo'lmasa, bugungi sana: " + date.today().strftime('%Y-%m-%d') + ")\n"
+            "- title: Xarid qilingan narsa, to'lov yoki do'kon nomi\n"
+            "- category: Quyidagi toifalardan mos keladigani:\n"
+            "  * Oziq-ovqat va supermarket\n"
+            "  * Kafe va restoranlar\n"
+            "  * Transport (yoqilg'i, taksi, jamoat transporti)\n"
+            "  * Kommunal, uy va aloqa xarajatlari\n"
+            "  * Salomatlik va sport\n"
+            "  * Shaxsiy xaridlar va kiyim-kechak\n"
+            "  * Ta'lim va obunalar\n"
+            "  * Kutilmagan / Boshqa xarajatlar\n"
+            "- payment_type: 'Karta' yoki 'Naqd'\n"
+            "- amount: Faqat son (masalan: 45000)\n\n"
+            "Natijani FAQAT JSON ro'yxat (list of objects) shaklida qaytaring, boshqa hech qanday izoh qo'shmang:\n\n"
+            + text[:30000]
         )
         config = genai_types.GenerateContentConfig(system_instruction=GEMINI_SYSTEM_PROMPT)
         response = client.models.generate_content(
@@ -532,29 +740,28 @@ def parse_bank_statement_with_gemini(api_key, text):
             data = [data]
         return data
     except Exception as e:
-        print(f"PDF Gemini error: {e}")
+        print(f"Document Gemini error: {e}")
         return None
+
+def parse_bank_statement_with_gemini(api_key, text):
+    return parse_document_with_gemini(api_key, text, "bank_statement")
 
 def parse_bank_statement_heuristic(text):
     """
-    PDF ichidan tranzaksiyalarni qidirish (O'zbekiston banklari: Click, Payme, Uzum, boshqalar uchun)
+    Bank ko'chirmalari (Click, Payme, Uzum, banklar) ichidan tranzaksiyalarni qidirish
     """
     transactions = []
     lines = text.split("\n")
     
-    # Qidiruv shabloni: Sana (DD.MM.YYYY yoki YYYY-MM-DD), Nomi va Summa
     date_pattern = r'(\d{2}[./-]\d{2}[./-]\d{4}|\d{4}-\d{2}-\d{2})'
-    amount_pattern = r'(\d+[\d\s.,]*)\s*(UZS|so\'m|сум)?'
     
     for line in lines:
         line_clean = line.strip()
         if not line_clean:
             continue
-        # Salbiy yoki chiqim amallari (- belgisi yoki O'tkazma/Xarid)
         d_match = re.search(date_pattern, line_clean)
         if d_match:
             tx_date_str = d_match.group(1)
-            # Standartlashtirish YYYY-MM-DD
             try:
                 if "." in tx_date_str:
                     parts = tx_date_str.split(".")
@@ -567,7 +774,6 @@ def parse_bank_statement_heuristic(text):
             except Exception:
                 parsed_date = date.today().strftime("%Y-%m-%d")
             
-            # Summa qidirish
             nums = re.findall(r'[-–—]?\s*(\d{1,3}(?:[\s.,]\d{3})*(?:[.,]\d{2})?)\s*(?:UZS|so\'m|сум)?', line_clean)
             if nums:
                 for n in nums:
@@ -575,7 +781,6 @@ def parse_bank_statement_heuristic(text):
                     try:
                         amt = float(val_str)
                         if 1000 <= amt <= 100000000:
-                            # Nomini aniqlash
                             title_part = re.sub(date_pattern, '', line_clean)
                             title_part = re.sub(r'[-–—]?\s*\d+[\d\s.,]*\s*(?:UZS|so\'m|сум)?', '', title_part).strip()
                             if not title_part or len(title_part) < 3:
@@ -593,6 +798,39 @@ def parse_bank_statement_heuristic(text):
                     except ValueError:
                         continue
                         
+    return transactions
+
+def parse_document_heuristic(text):
+    """
+    Hujjat ichidan xarajatlarni heuristik ajratib olish (Bank ko'chirmasi + Matn redaktori qaydlari)
+    """
+    # 1. Bank ko'chirmasi shaklida qidirish
+    txs = parse_bank_statement_heuristic(text)
+    if txs:
+        return txs
+
+    # 2. Oddiy matn redaktori qaydlari (masalan: Notepad, Word, RTF da har bir qatorda xarajat)
+    transactions = []
+    lines = text.split("\n")
+    for line in lines:
+        line_clean = line.strip()
+        if not line_clean or len(line_clean) < 3:
+            continue
+        parsed = parse_simple_text_expense(line_clean)
+        if parsed and isinstance(parsed, dict) and parsed.get("amount"):
+            tx_date = parsed.get("date", date.today().strftime("%Y-%m-%d"))
+            title = parsed.get("title", "Xarajat")
+            category = local_categorize(title)
+            payment_type = parsed.get("payment_type", "Naqd")
+            amount = float(parsed["amount"])
+            transactions.append({
+                "date": tx_date,
+                "title": title[:40].strip(),
+                "amount": amount,
+                "category": category,
+                "payment_type": payment_type
+            })
+            
     return transactions
 
 # --- FORMATLASH VA CHIQISH ---
@@ -725,7 +963,7 @@ def send_welcome(message):
         f"<b>Qanday ma'lumot kiritishingiz mumkin?</b>\n"
         f"1. 🎤 <b>Ovozli xabar:</b> '<i>Bugun 45 mingga tushlik qildim</i>' deb ayting (To'lov: Naqd).\n"
         f"2. 📸 <b>Chek fotosurati:</b> Xarid chekini rasmga olib yuboring (Summa, do'kon va to'lov turini o'zim aniqlayman).\n"
-        f"3. 📄 <b>PDF bank ko'chirmasi:</b> Click, Payme yoki bank ilovasidan olingan PDF ni yuboring (Karta xarajatlarini ajratib olaman).\n"
+        f"3. 📄 <b>Har qanday hujjat yoki fayl:</b> Word (.docx), Excel (.xlsx), PDF, TXT, CSV, RTF va boshqa istalgan matn redaktori formatidagi faylni yuboring (xarajatlarni avtomatik ajratib olaman).\n"
         f"4. 💬 <b>Oddiy matn:</b> Masalan, <code>50000 tushlik</code> yoki <code>karta 180000 korzinka</code>.\n\n"
         f"Quyidagi tugmalardan foydalanishingiz mumkin:"
     )
@@ -787,7 +1025,7 @@ def handle_add_expense_prompt(message):
         "1. Matn yozing: <code>45000 tushlik</code> yoki <code>karta 120000 korzinka</code>\n"
         "2. Yoki ovozli xabar (audio) yuboring;\n"
         "3. Yoki xarid chekini rasmga olib yuboring;\n"
-        "4. Yoki bank PDF ko'chirmasini yuboring."
+        "4. Yoki istalgan matn/hujjat faylini yuboring (Word, Excel, PDF, TXT, CSV, RTF va h.k.)."
     )
     bot.send_message(message.chat.id, msg)
 
@@ -1095,79 +1333,90 @@ def handle_photo_receipt(message):
     except Exception as e:
         bot.edit_message_text(f"❌ Xatolik yuz berdi: {e}", chat_id=message.chat.id, message_id=status_msg.message_id)
 
-# --- PDF BANK KO'CHIRMALARI BILAN ISHLASH ---
+# --- HAR QANDAY MATN REDAKTORI VA HUJJAT FAYLLARI BILAN ISHLASH ---
 @bot.message_handler(content_types=['document'])
-def handle_pdf_statement(message):
+def handle_document_file(message):
     doc = message.document
-    if not doc.file_name.lower().endswith(".pdf"):
-        bot.reply_to(message, "Iltimos, bank ko'chirmasini <b>PDF</b> formatida yuboring.")
-        return
-        
     user_id = message.from_user.id
     api_key = get_gemini_key(user_id)
+    file_name = doc.file_name or "hujjat.txt"
+    ext = os.path.splitext(file_name.lower())[1]
     
-    status_msg = bot.reply_to(message, "📄 Bank ko'chirmasi (PDF) yuklab olinmoqda va tahlil qilinmoqda...")
+    status_msg = bot.reply_to(message, f"📄 <b>{file_name}</b> yuklab olinmoqda va tahlil qilinmoqda...")
     
     temp_path = None
     try:
         file_info = bot.get_file(doc.file_id)
         file_bytes = bot.download_file(file_info.file_path)
         
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext or ".tmp") as f:
             f.write(file_bytes)
             temp_path = f.name
             
-        pdf_text = extract_text_from_pdf(temp_path)
-        if not pdf_text.strip():
-            bot.edit_message_text("⚠️ PDF fayldan matn ajratib bo'lmadi (ehtimol skanerlangan rasm bo'lishi mumkin).", chat_id=message.chat.id, message_id=status_msg.message_id)
-            return
-            
-        transactions = []
-        if api_key and HAS_GENAI:
-            transactions = parse_bank_statement_with_gemini(api_key, pdf_text) or []
-            
-        if not transactions:
-            # Lokal tahlilchi bilan harakat qilib ko'rish
-            transactions = parse_bank_statement_heuristic(pdf_text)
-            
-        if not transactions:
+        doc_text = extract_text_from_document(temp_path, file_name)
+        if not doc_text or not doc_text.strip():
             bot.edit_message_text(
-                "⚠️ Bank ko'chirmasidan xarajatlar topilmadi.\n"
-                "To'liq tahlil uchun Gemini kalitini qo'shib ko'ring: <code>/setkey KALIT</code>",
+                f"⚠️ <b>{file_name}</b> faylidan matn ajratib bo'lmadi.\n"
+                "Iltimos, faylda matn yoki xarajat ma'lumotlari mavjudligini tekshiring.",
                 chat_id=message.chat.id,
                 message_id=status_msg.message_id
             )
             return
             
-        # Tranzaksiyalarni saqlash (Bank ko'chirmasida faqat "Karta")
+        transactions = []
+        if api_key and HAS_GENAI:
+            transactions = parse_document_with_gemini(api_key, doc_text, file_name) or []
+            
+        if not transactions:
+            # Lokal tahlilchi (Bank ko'chirmalari yoki oddiy satrma-satr qaydlar)
+            transactions = parse_document_heuristic(doc_text)
+            
+        if not transactions:
+            bot.edit_message_text(
+                f"⚠️ <b>{file_name}</b> faylidan xarajatlar topilmadi.\n\n"
+                "To'liq AI tahlil uchun Gemini kalitini kiritib ko'ring: <code>/setkey KALIT</code>",
+                chat_id=message.chat.id,
+                message_id=status_msg.message_id
+            )
+            return
+            
         saved_count = 0
         total_sum = 0
         preview_text = ""
         
         for tx in transactions:
             dt = tx.get("date", date.today().strftime("%Y-%m-%d"))
-            title = tx.get("title", "Bank to'lovi")
+            title = tx.get("title", "Xarajat")
             cat = tx.get("category", local_categorize(title))
+            ptype = tx.get("payment_type", "Karta")
             amt = float(tx.get("amount", 0))
             if amt > 0:
-                add_transaction(user_id, dt, title, cat, "Karta", amt, source="pdf", msg_id=message.message_id)
+                add_transaction(user_id, dt, title, cat, ptype, amt, source=ext[1:] if ext else "doc", msg_id=message.message_id)
                 saved_count += 1
                 total_sum += amt
                 if saved_count <= 5:
-                    preview_text += f"• <code>{dt}</code> | <b>{title[:18]}</b>: <code>{format_currency(amt)}</code>\n"
+                    p_icon = "💳" if ptype == "Karta" else "💵"
+                    preview_text += f"• <code>{dt}</code> | <b>{title[:18]}</b> ({p_icon}): <code>{format_currency(amt)}</code>\n"
                     
         res_msg = (
-            f"✅ <b>Bank ko'chirmasi muvaffaqiyatli qayta ishlandi!</b>\n\n"
+            f"✅ <b>{file_name}</b> muvaffaqiyatli qayta ishlandi!\n\n"
             f"📥 <b>Kiritilgan amallar soni:</b> {saved_count} ta\n"
-            f"💳 <b>To'lov turi:</b> Karta\n"
             f"💰 <b>Jami xarajat:</b> <code>{format_currency(total_sum)}</code>\n\n"
-            f"<b>Ko'chirmadan namunalar:</b>\n{preview_text}"
+            f"<b>Hujjatdan namunalar:</b>\n{preview_text}"
         )
         if saved_count > 5:
             res_msg += f"<i>...va yana {saved_count - 5} ta operatsiya saqlandi.</i>\n"
             
         res_msg += "\nTo'liq hisobotni ko'rish uchun <b>📊 Oylik hisobot</b> tugmasini bosing."
-        bot.edit_message_text(res_msg, chat_id=message.chat.id, message_id=status_msg.message_id)
+        
+        # Agar bitta xarajat kiritilgan bo'lsa, o'chirish tugmachasini qo'shamiz
+        reply_markup = None
+        if saved_count == 1 and len(transactions) == 1:
+            recent = get_recent_transactions(user_id, limit=1)
+            if recent:
+                reply_markup = get_delete_single_markup(recent[0][0])
+                
+        bot.edit_message_text(res_msg, chat_id=message.chat.id, message_id=status_msg.message_id, reply_markup=reply_markup)
         
     except Exception as e:
         bot.edit_message_text(f"❌ Xatolik yuz berdi: {e}", chat_id=message.chat.id, message_id=status_msg.message_id)
