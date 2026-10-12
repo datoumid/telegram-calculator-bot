@@ -33,6 +33,8 @@ try:
 except ImportError:
     HAS_GENAI = False
 
+HAS_GEMINI = HAS_GENAI
+
 try:
     import pypdf
     HAS_PYPDF = True
@@ -306,43 +308,51 @@ Ko'p xarajatlar (masalan, bank ko'chirmasi) uchun:
 def call_gemini_vision(api_key, image_bytes, prompt="Ushbu chek fotosuratidan ma'lumotlarni o'qing"):
     if not HAS_GENAI or not api_key:
         return None
-    try:
-        client = genai.Client(api_key=api_key)
-        part = genai_types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
-        config = genai_types.GenerateContentConfig(system_instruction=GEMINI_SYSTEM_PROMPT)
-        response = client.models.generate_content(
-            model="gemini-3.8-flash",
-            contents=[part, prompt],
-            config=config
-        )
-        txt = response.text.strip()
-        txt = re.sub(r'^```json\s*', '', txt)
-        txt = re.sub(r'```$', '', txt).strip()
-        return json.loads(txt)
-    except Exception as e:
-        print(f"Gemini Vision Error: {e}")
-        return None
+    for attempt in range(2):
+        try:
+            client = genai.Client(api_key=api_key)
+            part = genai_types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
+            config = genai_types.GenerateContentConfig(system_instruction=GEMINI_SYSTEM_PROMPT)
+            response = client.models.generate_content(
+                model="gemini-3.8-flash",
+                contents=[part, prompt],
+                config=config
+            )
+            txt = response.text.strip()
+            txt = re.sub(r'^```json\s*', '', txt)
+            txt = re.sub(r'```$', '', txt).strip()
+            return json.loads(txt)
+        except Exception as e:
+            print(f"Gemini Vision Error (attempt {attempt+1}): {e}")
+            if attempt == 0:
+                import time; time.sleep(1)
+                continue
+            return None
 
 def call_gemini_audio(api_key, audio_bytes, mime_type="audio/ogg"):
     if not HAS_GENAI or not api_key:
         return None
-    try:
-        client = genai.Client(api_key=api_key)
-        part = genai_types.Part.from_bytes(data=audio_bytes, mime_type=mime_type)
-        prompt = "Ushbu ovozli xabarni eshitib, xarajat summasi va nima uchun sarflanganini aniqlang. Bugungi sana: " + date.today().strftime("%Y-%m-%d")
-        config = genai_types.GenerateContentConfig(system_instruction=GEMINI_SYSTEM_PROMPT)
-        response = client.models.generate_content(
-            model="gemini-3.8-flash",
-            contents=[part, prompt],
-            config=config
-        )
-        txt = response.text.strip()
-        txt = re.sub(r'^```json\s*', '', txt)
-        txt = re.sub(r'```$', '', txt).strip()
-        return json.loads(txt)
-    except Exception as e:
-        print(f"Gemini Audio Error: {e}")
-        return None
+    for attempt in range(2):
+        try:
+            client = genai.Client(api_key=api_key)
+            part = genai_types.Part.from_bytes(data=audio_bytes, mime_type=mime_type)
+            prompt = "Ushbu ovozli xabarni eshitib, xarajat summasi va nima uchun sarflanganini aniqlang. Bugungi sana: " + date.today().strftime("%Y-%m-%d")
+            config = genai_types.GenerateContentConfig(system_instruction=GEMINI_SYSTEM_PROMPT)
+            response = client.models.generate_content(
+                model="gemini-3.8-flash",
+                contents=[part, prompt],
+                config=config
+            )
+            txt = response.text.strip()
+            txt = re.sub(r'^```json\s*', '', txt)
+            txt = re.sub(r'```$', '', txt).strip()
+            return json.loads(txt)
+        except Exception as e:
+            print(f"Gemini Audio Error (attempt {attempt+1}): {e}")
+            if attempt == 0:
+                import time; time.sleep(1)
+                continue
+            return None
 
 def call_gemini_text(api_key, user_text):
     if not HAS_GENAI or not api_key:
@@ -719,13 +729,22 @@ def handle_voice_message(message):
         file_bytes = bot.download_file(file_info.file_path)
         
         parsed = None
-        if api_key and HAS_GEMINI:
+        if api_key and HAS_GENAI:
             parsed = call_gemini_audio(api_key, file_bytes, mime_type="audio/ogg")
             
         if not parsed:
+            if not api_key:
+                err_text = (
+                    "⚠️ Ovozli xabarni avtomatik eshitish uchun <b>Gemini API kaliti</b> zarur.\n"
+                    "Iltimos, <code>/setkey KALITINGIZ</code> orqali kalitingizni kiriting yoki xarajatni matn ko'rinishida yozing (masalan: <code>35000 tushlik</code>)."
+                )
+            else:
+                err_text = (
+                    "⚠️ Ovozli xabarni tushunib bo'lmadi yoki AI serverida vaqtinchalik yuklama mavjud.\n"
+                    "Iltimos, ovozli xabarni qaytadan yuboring yoki xarajatni matn ko'rinishida yozing (masalan: <code>35000 tushlik</code>)."
+                )
             bot.edit_message_text(
-                "⚠️ Ovozli xabarni avtomatik eshitish uchun <b>Gemini API kaliti</b> zarur.\n"
-                "Iltimos, <code>/setkey KALITINGIZ</code> orqali kalitingizni kiriting yoki xarajatni matn ko'rinishida yozing (masalan: <code>35000 tushlik</code>).",
+                err_text,
                 chat_id=message.chat.id,
                 message_id=status_msg.message_id
             )
@@ -767,7 +786,7 @@ def handle_photo_receipt(message):
         image_bytes = bot.download_file(file_info.file_path)
         
         parsed = None
-        if api_key and HAS_GEMINI:
+        if api_key and HAS_GENAI:
             parsed = call_gemini_vision(api_key, image_bytes)
             
         if not parsed:
@@ -828,7 +847,7 @@ def handle_pdf_statement(message):
             return
             
         transactions = []
-        if api_key and HAS_GEMINI:
+        if api_key and HAS_GENAI:
             transactions = parse_bank_statement_with_gemini(api_key, pdf_text) or []
             
         if not transactions:
@@ -896,7 +915,7 @@ def handle_text_expense(message):
     api_key = get_gemini_key(user_id)
     
     parsed = None
-    if api_key and HAS_GEMINI:
+    if api_key and HAS_GENAI:
         parsed = call_gemini_text(api_key, text)
         
     if not parsed:
