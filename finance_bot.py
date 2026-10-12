@@ -567,10 +567,26 @@ def get_main_keyboard():
     b3 = types.KeyboardButton("➕ Xarajat kiritish")
     b4 = types.KeyboardButton("🧾 Oxirgi amallar")
     b5 = types.KeyboardButton("📁 Excel/CSV eksport")
-    b6 = types.KeyboardButton("⚙️ Sozlamalar (API Key)")
+    b6 = types.KeyboardButton("🗑 Tarixni o'chirish")
     markup.add(b1, b2)
     markup.add(b3, b4)
     markup.add(b5, b6)
+    return markup
+
+def get_delete_single_markup(tx_id):
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("🗑 Ushbu xarajatni o'chirish", callback_data=f"del_{tx_id}"))
+    return markup
+
+def get_recent_markup(rows):
+    markup = types.InlineKeyboardMarkup(row_width=5)
+    buttons = []
+    for idx, r in enumerate(rows, start=1):
+        tx_id = r[0]
+        buttons.append(types.InlineKeyboardButton(f"🗑 {idx}", callback_data=f"del_{tx_id}"))
+    if buttons:
+        markup.add(*buttons)
+        markup.add(types.InlineKeyboardButton("🧹 Barcha tarixni tozalash", callback_data="ask_clear_all"))
     return markup
 
 # Foydalanuvchi holati (FSM / state)
@@ -621,7 +637,7 @@ def handle_daily_report(message):
         
     bot.send_message(message.chat.id, msg)
 
-@bot.message_handler(func=lambda msg: msg.text == "🧾 Oxirgi amallar")
+@bot.message_handler(func=lambda msg: msg.text in ["🧾 Oxirgi amallar", "🗑 Tarixni o'chirish"] or msg.text in ["/history", "/delete", "/clear"])
 def handle_recent(message):
     user_id = message.from_user.id
     rows = get_recent_transactions(user_id, limit=10)
@@ -630,13 +646,18 @@ def handle_recent(message):
         bot.send_message(message.chat.id, "Sizda hali saqlangan xarajatlar mavjud emas.")
         return
         
-    msg = "🧾 <b>So'nggi 10 ta xarajat:</b>\n\n"
-    for r in rows:
+    msg = "🧾 <b>So'nggi xarajatlar ro'yxati:</b>\n"
+    msg += "<i>O'chirmoqchi bo'lgan xarajat raqamini pastdagi tugmalardan tanlang:</i>\n\n"
+    
+    num_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+    for idx, r in enumerate(rows, start=1):
+        num_str = num_emojis[idx-1] if idx <= 10 else f"{idx}."
         icon = CATEGORY_ICONS.get(r[3], "•")
         pt = "💳" if r[4] == "Karta" else "💵"
-        msg += f"• <code>{r[1]}</code> | {icon} <b>{r[2]}</b> ({pt}): <code>{format_currency(r[5])}</code>\n"
+        msg += f"{num_str} <code>{r[1]}</code> | {icon} <b>{r[2]}</b> ({pt}): <code>{format_currency(r[5])}</code>\n"
         
-    bot.send_message(message.chat.id, msg)
+    markup = get_recent_markup(rows)
+    bot.send_message(message.chat.id, msg, reply_markup=markup)
 
 @bot.message_handler(func=lambda msg: msg.text == "➕ Xarajat kiritish")
 def handle_add_expense_prompt(message):
@@ -716,6 +737,77 @@ def handle_set_key(message):
     set_gemini_key(message.from_user.id, key)
     bot.reply_to(message, "✅ <b>Gemini API kalitingiz muvaffaqiyatli saqlandi!</b>\nEndi ovozli xabarlar va cheklar avtomatik AI orqali tahlil qilinadi.")
 
+# --- TARIXNI O'CHIRISH VA CALLBACK HANDLERS ---
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callback_query(call):
+    user_id = call.from_user.id
+    data = call.data
+    
+    if data.startswith("del_"):
+        try:
+            tx_id = int(data.split("_")[1])
+            success = delete_transaction(user_id, tx_id)
+            if success:
+                bot.answer_callback_query(call.id, "Xarajat o'chirildi! 🗑")
+                try:
+                    bot.edit_message_text(
+                        "🗑 <b>Xarajat tarixdan muvaffaqiyatli o'chirildi.</b>",
+                        chat_id=call.message.chat.id,
+                        message_id=call.message.message_id
+                    )
+                except Exception:
+                    pass
+            else:
+                bot.answer_callback_query(call.id, "Topilmadi yoki allaqachon o'chirilgan.")
+        except Exception:
+            bot.answer_callback_query(call.id, "Xatolik yuz berdi.")
+            
+    elif data == "ask_clear_all":
+        confirm_markup = types.InlineKeyboardMarkup(row_width=2)
+        confirm_markup.add(
+            types.InlineKeyboardButton("✅ Ha, tozalash", callback_data="do_clear_all"),
+            types.InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel_clear")
+        )
+        bot.answer_callback_query(call.id)
+        try:
+            bot.edit_message_text(
+                "⚠️ <b>Diqqat!</b>\n\nBarcha xarajatlar tarixini butunlay o'chirib tashlamoqchimisiz?\nBu amalni ortga qaytarib bo'lmaydi.",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=confirm_markup
+            )
+        except Exception:
+            pass
+            
+    elif data == "do_clear_all":
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM transactions WHERE user_id = ?", (user_id,))
+        count = cur.rowcount
+        conn.commit()
+        conn.close()
+        
+        bot.answer_callback_query(call.id, "Barcha tarix tozalandi!")
+        try:
+            bot.edit_message_text(
+                f"🧹 <b>Barcha xarajatlar tarixi muvaffaqiyatli tozalandi!</b>\n(Jami o'chirilgan yozuvlar soni: {count} ta)",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id
+            )
+        except Exception:
+            pass
+            
+    elif data == "cancel_clear":
+        bot.answer_callback_query(call.id, "Bekor qilindi.")
+        try:
+            bot.edit_message_text(
+                "❌ Tarixni tozalash bekor qilindi.",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id
+            )
+        except Exception:
+            pass
+
 # --- OVOZLI XABARLAR BILAN ISHLASH ---
 @bot.message_handler(content_types=['voice', 'audio'])
 def handle_voice_message(message):
@@ -756,7 +848,7 @@ def handle_voice_message(message):
         if not parsed.get("date"):
             parsed["date"] = date.today().strftime("%Y-%m-%d")
             
-        add_transaction(
+        tx_id = add_transaction(
             user_id=user_id,
             tx_date=parsed["date"],
             title=parsed["title"],
@@ -767,7 +859,7 @@ def handle_voice_message(message):
         )
         
         resp_text = format_confirmation(parsed)
-        bot.edit_message_text(resp_text, chat_id=message.chat.id, message_id=status_msg.message_id)
+        bot.edit_message_text(resp_text, chat_id=message.chat.id, message_id=status_msg.message_id, reply_markup=get_delete_single_markup(tx_id))
         
     except Exception as e:
         bot.edit_message_text(f"❌ Xatolik yuz berdi: {e}", chat_id=message.chat.id, message_id=status_msg.message_id)
@@ -803,7 +895,7 @@ def handle_photo_receipt(message):
         if not parsed.get("payment_type"):
             parsed["payment_type"] = "Karta"
             
-        add_transaction(
+        tx_id = add_transaction(
             user_id=user_id,
             tx_date=parsed["date"],
             title=parsed["title"],
@@ -814,7 +906,7 @@ def handle_photo_receipt(message):
         )
         
         resp_text = format_confirmation(parsed)
-        bot.edit_message_text(resp_text, chat_id=message.chat.id, message_id=status_msg.message_id)
+        bot.edit_message_text(resp_text, chat_id=message.chat.id, message_id=status_msg.message_id, reply_markup=get_delete_single_markup(tx_id))
         
     except Exception as e:
         bot.edit_message_text(f"❌ Xatolik yuz berdi: {e}", chat_id=message.chat.id, message_id=status_msg.message_id)
@@ -928,7 +1020,7 @@ def handle_text_expense(message):
         payment_type = parsed.get("payment_type", "Naqd")
         amount = float(parsed["amount"])
         
-        add_transaction(user_id, tx_date, title, category, payment_type, amount, source="text")
+        tx_id = add_transaction(user_id, tx_date, title, category, payment_type, amount, source="text")
         
         resp = format_confirmation({
             "date": tx_date,
@@ -937,7 +1029,7 @@ def handle_text_expense(message):
             "payment_type": payment_type,
             "amount": amount
         })
-        bot.reply_to(message, resp)
+        bot.reply_to(message, resp, reply_markup=get_delete_single_markup(tx_id))
     else:
         bot.reply_to(
             message,
