@@ -23,7 +23,9 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8930567763:AAHmzla7oOlJYxv8jCFwq-g91c2P
 GLOBAL_GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
 
 import telebot
-from telebot import types
+from telebot import types, apihelper
+
+apihelper.ENABLE_MIDDLEWARE = True
 
 # Modern Google GenAI SDK
 try:
@@ -85,9 +87,19 @@ def init_db():
             amount REAL NOT NULL,
             type TEXT DEFAULT 'expense',
             source TEXT DEFAULT 'text',
+            msg_id INTEGER,
+            bot_msg_id INTEGER,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    try:
+        cur.execute("ALTER TABLE transactions ADD COLUMN msg_id INTEGER")
+    except Exception:
+        pass
+    try:
+        cur.execute("ALTER TABLE transactions ADD COLUMN bot_msg_id INTEGER")
+    except Exception:
+        pass
     # Foydalanuvchi sozlamalari (masalan, shaxsiy Gemini API kaliti)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS user_settings (
@@ -96,11 +108,114 @@ def init_db():
             currency TEXT DEFAULT 'so''m'
         )
     """)
+    # Chatdagi xabarlarni kuzatish (tozalash uchun)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            chat_id INTEGER,
+            message_id INTEGER,
+            PRIMARY KEY (chat_id, message_id)
+        )
+    """)
     conn.commit()
     conn.close()
 
 def get_connection():
     return sqlite3.connect(DB_PATH)
+
+def record_msg(chat_id, message_id):
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("INSERT OR IGNORE INTO chat_messages (chat_id, message_id) VALUES (?, ?)", (chat_id, message_id))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+def get_tracked_messages(chat_id):
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT message_id FROM chat_messages WHERE chat_id = ? ORDER BY message_id DESC", (chat_id,))
+        rows = [r[0] for r in cur.fetchall()]
+        conn.close()
+        return rows
+    except Exception:
+        return []
+
+def remove_tracked_messages(chat_id):
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM chat_messages WHERE chat_id = ?", (chat_id,))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+def clear_entire_chat(chat_id, current_msg_id):
+    tracked = set(get_tracked_messages(chat_id))
+    # Joriy xabardan orqaga 350 ta ID ni ham qo'shamiz (barcha avval yuborilgan fayllar va bot xabarlari uchun)
+    for mid in range(max(1, current_msg_id - 350), current_msg_id + 1):
+        tracked.add(mid)
+        
+    msg_ids = sorted(list(tracked), reverse=True)
+    
+    # 50 tadan bo'lib o'chirish (Telegram Bot API cheklovi)
+    for i in range(0, len(msg_ids), 50):
+        chunk = msg_ids[i:i + 50]
+        try:
+            bot.delete_messages(chat_id, chunk)
+        except Exception:
+            for mid in chunk:
+                try:
+                    bot.delete_message(chat_id, mid)
+                except Exception:
+                    pass
+                    
+    remove_tracked_messages(chat_id)
+    
+    try:
+        new_msg = bot.send_message(
+            chat_id,
+            "🧹 <b>Chat muvaffaqiyatli tozalandi!</b>\n\n"
+            "Barcha yuborilgan fayllar, ovozlar, chek rasmlari va bot xabarlari chatdan o'chirildi.\n\n"
+            "<i>💡 Maslahat: Agar Telegram ilovangizda butun chat tarixini bir zumda 100% yo'qotmoqchi bo'lsangiz, Telegram chat sozlamalaridagi 'Tarixni tozalash' (Очистить историю) menyusidan ham foydalanishingiz mumkin.</i>",
+            reply_markup=get_main_keyboard()
+        )
+        record_msg(chat_id, new_msg.message_id)
+    except Exception:
+        pass
+
+# Avtomatik xabarlarni kuzatish (barcha kiruvchi va chiquvchi xabarlar uchun)
+_orig_send_message = bot.send_message
+def _tracked_send_message(*args, **kwargs):
+    res = _orig_send_message(*args, **kwargs)
+    if res and hasattr(res, 'chat') and hasattr(res, 'message_id'):
+        record_msg(res.chat.id, res.message_id)
+    return res
+bot.send_message = _tracked_send_message
+
+_orig_reply_to = bot.reply_to
+def _tracked_reply_to(*args, **kwargs):
+    res = _orig_reply_to(*args, **kwargs)
+    if res and hasattr(res, 'chat') and hasattr(res, 'message_id'):
+        record_msg(res.chat.id, res.message_id)
+    return res
+bot.reply_to = _tracked_reply_to
+
+_orig_send_document = bot.send_document
+def _tracked_send_document(*args, **kwargs):
+    res = _orig_send_document(*args, **kwargs)
+    if res and hasattr(res, 'chat') and hasattr(res, 'message_id'):
+        record_msg(res.chat.id, res.message_id)
+    return res
+bot.send_document = _tracked_send_document
+
+@bot.middleware_handler(update_types=['message'])
+def _track_incoming_message(bot_instance, message):
+    if message and hasattr(message, 'chat') and hasattr(message, 'message_id'):
+        record_msg(message.chat.id, message.message_id)
 
 def get_gemini_key(user_id):
     conn = get_connection()
@@ -123,7 +238,7 @@ def set_gemini_key(user_id, key):
     conn.commit()
     conn.close()
 
-def add_transaction(user_id, tx_date, title, category, payment_type, amount, tx_type='expense', source='text'):
+def add_transaction(user_id, tx_date, title, category, payment_type, amount, tx_type='expense', source='text', msg_id=None, bot_msg_id=None):
     conn = get_connection()
     cur = conn.cursor()
     now_time = datetime.now().strftime("%H:%M")
@@ -131,9 +246,9 @@ def add_transaction(user_id, tx_date, title, category, payment_type, amount, tx_
         tx_date = date.today().strftime("%Y-%m-%d")
     
     cur.execute("""
-        INSERT INTO transactions (user_id, date, time, title, category, payment_type, amount, type, source)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (user_id, tx_date, now_time, title, category, payment_type, amount, tx_type, source))
+        INSERT INTO transactions (user_id, date, time, title, category, payment_type, amount, type, source, msg_id, bot_msg_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (user_id, tx_date, now_time, title, category, payment_type, amount, tx_type, source, msg_id, bot_msg_id))
     tx_id = cur.lastrowid
     conn.commit()
     conn.close()
@@ -191,11 +306,14 @@ def get_recent_transactions(user_id, limit=10):
 def delete_transaction(user_id, tx_id):
     conn = get_connection()
     cur = conn.cursor()
+    cur.execute("SELECT msg_id, bot_msg_id FROM transactions WHERE user_id = ? AND id = ?", (user_id, tx_id))
+    row = cur.fetchone()
     cur.execute("DELETE FROM transactions WHERE id = ? AND user_id = ?", (tx_id, user_id))
     affected = cur.rowcount
     conn.commit()
     conn.close()
-    return affected > 0
+    msg_ids = (row[0], row[1]) if row else (None, None)
+    return (affected > 0), msg_ids
 
 # --- LOKAL HEURISTIK TAHLILCHI (OFFLINE FALLBACK) ---
 def local_categorize(text):
@@ -568,9 +686,11 @@ def get_main_keyboard():
     b4 = types.KeyboardButton("🧾 Oxirgi amallar")
     b5 = types.KeyboardButton("📁 Excel/CSV eksport")
     b6 = types.KeyboardButton("🗑 Tarixni o'chirish")
+    b7 = types.KeyboardButton("🧹 Butun chatni tozalash")
     markup.add(b1, b2)
     markup.add(b3, b4)
     markup.add(b5, b6)
+    markup.add(b7)
     return markup
 
 def get_delete_single_markup(tx_id):
@@ -587,6 +707,7 @@ def get_recent_markup(rows):
     if buttons:
         markup.add(*buttons)
         markup.add(types.InlineKeyboardButton("🧹 Barcha tarixni tozalash", callback_data="ask_clear_all"))
+        markup.add(types.InlineKeyboardButton("🗑 Butun chatni tozalash", callback_data="ask_clear_chat"))
     return markup
 
 # Foydalanuvchi holati (FSM / state)
@@ -746,17 +867,54 @@ def handle_callback_query(call):
     if data.startswith("del_"):
         try:
             tx_id = int(data.split("_")[1])
-            success = delete_transaction(user_id, tx_id)
+            success, (orig_msg_id, orig_bot_msg_id) = delete_transaction(user_id, tx_id)
             if success:
                 bot.answer_callback_query(call.id, "Xarajat o'chirildi! 🗑")
-                try:
-                    bot.edit_message_text(
-                        "🗑 <b>Xarajat tarixdan muvaffaqiyatli o'chirildi.</b>",
-                        chat_id=call.message.chat.id,
-                        message_id=call.message.message_id
-                    )
-                except Exception:
-                    pass
+                # 1. Foydalanuvchining asl yuborgan fayli (ovoz, rasm, PDF, matn)ni chatdan o'chirish
+                target_msg = orig_msg_id
+                if not target_msg and call.message.reply_to_message:
+                    target_msg = call.message.reply_to_message.message_id
+                if target_msg:
+                    try:
+                        bot.delete_message(call.message.chat.id, target_msg)
+                    except Exception:
+                        pass
+                
+                # 2. Agar bitta xarajat kartochkasi bo'lsa (reply_markup bitta del tugmasiga ega bo'lsa)
+                is_single = (call.message.reply_markup and len(call.message.reply_markup.keyboard) <= 1)
+                if is_single:
+                    try:
+                        bot.delete_message(call.message.chat.id, call.message.message_id)
+                    except Exception:
+                        try:
+                            bot.edit_message_text(
+                                "🗑 <b>Xarajat va yuborilgan fayl chatdan o'chirildi.</b>",
+                                chat_id=call.message.chat.id,
+                                message_id=call.message.message_id
+                            )
+                        except Exception:
+                            pass
+                else:
+                    # Oxirgi amallar ro'yxatidan o'chirilgan bo'lsa, ro'yxatni yangilash
+                    rows = get_recent_transactions(user_id, limit=10)
+                    if not rows:
+                        try:
+                            bot.edit_message_text("🧾 Barcha so'nggi xarajatlar o'chirildi.", chat_id=call.message.chat.id, message_id=call.message.message_id)
+                        except Exception:
+                            pass
+                    else:
+                        num_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+                        msg = "🧾 <b>So'nggi xarajatlar ro'yxati:</b>\n<i>O'chirmoqchi bo'lgan xarajat raqamini tanlang:</i>\n\n"
+                        for idx, r in enumerate(rows, start=1):
+                            num_str = num_emojis[idx-1] if idx <= 10 else f"{idx}."
+                            icon = CATEGORY_ICONS.get(r[3], "•")
+                            pt = "💳" if r[4] == "Karta" else "💵"
+                            msg += f"{num_str} <code>{r[1]}</code> | {icon} <b>{r[2]}</b> ({pt}): <code>{format_currency(r[5])}</code>\n"
+                        markup = get_recent_markup(rows)
+                        try:
+                            bot.edit_message_text(msg, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=markup)
+                        except Exception:
+                            pass
             else:
                 bot.answer_callback_query(call.id, "Topilmadi yoki allaqachon o'chirilgan.")
         except Exception:
@@ -797,11 +955,35 @@ def handle_callback_query(call):
         except Exception:
             pass
             
+    elif data == "ask_clear_chat":
+        confirm_markup = types.InlineKeyboardMarkup(row_width=2)
+        confirm_markup.add(
+            types.InlineKeyboardButton("✅ Ha, chatni tozalash", callback_data="do_clear_chat"),
+            types.InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel_clear")
+        )
+        bot.answer_callback_query(call.id)
+        try:
+            bot.edit_message_text(
+                "🧹 <b>Butun chatni tozalash:</b>\n\n"
+                "Chatdagi siz yuborgan barcha ovozli xabarlar, chek fotosuratlari, PDF fayllar va bot xabarlari o'chirib tashlanadi.\n\n"
+                "<i>(Eslatma: Xarajatlar statistikasi bazada saqlanib qoladi).</i>\n\n"
+                "Rostdan ham chatni tozalashni xohlaysizmi?",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=confirm_markup
+            )
+        except Exception:
+            pass
+            
+    elif data == "do_clear_chat":
+        bot.answer_callback_query(call.id, "Chat tozalanmoqda... 🧹")
+        clear_entire_chat(call.message.chat.id, call.message.message_id)
+            
     elif data == "cancel_clear":
         bot.answer_callback_query(call.id, "Bekor qilindi.")
         try:
             bot.edit_message_text(
-                "❌ Tarixni tozalash bekor qilindi.",
+                "❌ Amaliyot bekor qilindi.",
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id
             )
@@ -855,7 +1037,8 @@ def handle_voice_message(message):
             category=parsed.get("category", "Kutilmagan / Boshqa xarajatlar"),
             payment_type=parsed["payment_type"],
             amount=parsed["amount"],
-            source="voice"
+            source="voice",
+            msg_id=message.message_id
         )
         
         resp_text = format_confirmation(parsed)
@@ -902,7 +1085,8 @@ def handle_photo_receipt(message):
             category=parsed.get("category", "Kutilmagan / Boshqa xarajatlar"),
             payment_type=parsed["payment_type"],
             amount=parsed["amount"],
-            source="photo"
+            source="photo",
+            msg_id=message.message_id
         )
         
         resp_text = format_confirmation(parsed)
@@ -966,7 +1150,7 @@ def handle_pdf_statement(message):
             cat = tx.get("category", local_categorize(title))
             amt = float(tx.get("amount", 0))
             if amt > 0:
-                add_transaction(user_id, dt, title, cat, "Karta", amt, source="pdf")
+                add_transaction(user_id, dt, title, cat, "Karta", amt, source="pdf", msg_id=message.message_id)
                 saved_count += 1
                 total_sum += amt
                 if saved_count <= 5:
@@ -994,6 +1178,25 @@ def handle_pdf_statement(message):
             except Exception:
                 pass
 
+# --- BUTUN CHATNI TOZALASH HANDLER ---
+@bot.message_handler(func=lambda msg: msg.text == "🧹 Butun chatni tozalash" or msg.text in ["/clearchat", "/clear_chat"])
+def handle_clear_chat_prompt(message):
+    record_msg(message.chat.id, message.message_id)
+    confirm_markup = types.InlineKeyboardMarkup(row_width=2)
+    confirm_markup.add(
+        types.InlineKeyboardButton("✅ Ha, chatni tozalash", callback_data="do_clear_chat"),
+        types.InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel_clear")
+    )
+    sent = bot.reply_to(
+        message,
+        "🧹 <b>Chatni tozalash:</b>\n\n"
+        "Siz yuborgan barcha fayllar (ovozli xabarlar, chek fotosuratlari, PDF) hamda bot xabarlari chatdan to'liq o'chirib tashlanadi.\n"
+        "<i>(Xarajatlar bazadagi statistikalarda saqlanib qoladi).</i>\n\n"
+        "Davom etasizmi?",
+        reply_markup=confirm_markup
+    )
+    record_msg(message.chat.id, sent.message_id)
+
 # --- MATN ORQALI KIRITISH ---
 @bot.message_handler(func=lambda msg: True)
 def handle_text_expense(message):
@@ -1016,11 +1219,11 @@ def handle_text_expense(message):
     if parsed and isinstance(parsed, dict) and parsed.get("amount"):
         tx_date = parsed.get("date", date.today().strftime("%Y-%m-%d"))
         title = parsed.get("title", "Xarajat")
-        category = parsed.get("category", local_categorize(title))
+        category = local_categorize(title)
         payment_type = parsed.get("payment_type", "Naqd")
         amount = float(parsed["amount"])
         
-        tx_id = add_transaction(user_id, tx_date, title, category, payment_type, amount, source="text")
+        tx_id = add_transaction(user_id, tx_date, title, category, payment_type, amount, source="text", msg_id=message.message_id)
         
         resp = format_confirmation({
             "date": tx_date,
